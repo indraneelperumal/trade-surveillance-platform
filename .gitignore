@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+awsvenv/
+*.pkl
+*.parquet
+.DS_Store
+*.zip
+out.json
+function.zip
+aws-msk-iam-auth/

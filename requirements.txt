@@ -1,0 +1,11 @@
+pandas
+pyarrow
+scikit-learn
+shap
+langgraph
+langchain
+langchain-anthropic
+anthropic
+streamlit
+python-dotenv
+boto3
