@@ -14,6 +14,13 @@ python feature_engineering.py
 # Run anomaly detection (reads features.parquet, writes anomalies.parquet + model artefacts)
 python anomaly_model.py
 
+# Investigate a single flagged trade (Phase 3 — LangGraph orchestrator)
+python -c "
+from agents import investigate_trade
+result = investigate_trade('TRADE_ID_HERE', auto_approve=True)
+print(result['verdict'], result['compliance_memo'])
+"
+
 # Set up Glue catalog + Athena view (idempotent, run once per environment)
 python step1_setup_glue_athena.py
 ```
@@ -36,6 +43,12 @@ Athena view  → trade_surv.raw_trades_v                         ↓
                                                     S3: processed/anomalies.parquet
                                                     S3: model/isolation_forest.pkl
                                                     S3: model/medians.json
+                                                               ↓
+                                                    agents/orchestrator.py (Phase 3)
+                                                    investigate_trade(trade_id)
+                                                    → 4-node LangGraph StateGraph
+                                                    → Claude Haiku compliance memo
+                                                    S3: memos/{trade_id}.json
 ```
 
 **`lambda_function.py`** — Generates synthetic trades for 7 symbols (AAPL, MSFT, TSLA, AMZN, NVDA, GOOGL, META) with price random-walks, heavy-tailed volumes, and configurable off-hours/OTC ratios. Publishes N_TRADES records per invocation to the Kinesis stream named by `STREAM_NAME`. Key env vars: `STREAM_NAME`, `NUM_TRADES` (default 5), `EXT_HOURS_PCT` (default 0.10), `OTC_PCT` (default 0.15).
@@ -47,6 +60,8 @@ Athena view  → trade_surv.raw_trades_v                         ↓
 **`feature_engineering.py`** — Downloads all 30,424+ NDJSON files from `raw/` using 32 parallel threads, engineers 12 features, and writes `features/features.parquet` (Snappy-compressed) using a write-to-temp-key + `copy_object` pattern for safe overwrites.
 
 **`anomaly_model.py`** — Reads `features/features.parquet`, injects 50 labelled synthetic anomalies for recall validation, trains `IsolationForest(n_estimators=200, contamination=0.08, random_state=42)` on the full frame, scores every trade, runs SHAP TreeExplainer on flagged trades only, classifies anomaly type by rule, validates synthetic recall (target ≥ 80%), removes synthetics, and writes three artefacts to S3. Achieved: 88% synthetic recall, ~12,100 anomalies flagged (8% of 152,010 trades).
+
+**`agents/`** — Phase 3 LangGraph orchestrator. Entry point: `from agents import investigate_trade`. Requires `ANTHROPIC_API_KEY` in `.env` in addition to `AWS_PROFILE`.
 
 ## AWS Resources
 
@@ -71,6 +86,7 @@ Athena view  → trade_surv.raw_trades_v                         ↓
 | `processed/anomalies.parquet` | `anomaly_model.py` | 152,010 rows × 40 cols, Snappy |
 | `model/isolation_forest.pkl` | `anomaly_model.py` | Trained IsolationForest (~2.4 MB) |
 | `model/medians.json` | `anomaly_model.py` | Per-feature medians for inference |
+| `memos/{trade_id}.json` | `agents/orchestrator.py` | Structured compliance memo JSON |
 | `athena-results/` | Athena | Query result CSVs |
 
 ## Raw Data Schema
@@ -125,6 +141,57 @@ Anomaly type rules (applied to flagged trades only):
 | `unknown` | flagged but no condition matches |
 
 To score new trades against the saved model: load `model/medians.json` for NaN-filling, `model/isolation_forest.pkl` for inference. Apply the same bool→int cast for `is_off_hours`/`is_otc` before calling `decision_function`.
+
+## Agent Orchestrator Details (Phase 3)
+
+`agents/` contains a 4-node LangGraph StateGraph (`agents/orchestrator.py`). Call via `investigate_trade(trade_id, auto_approve=False)`.
+
+### Graph nodes
+
+| Node | Purpose |
+|---|---|
+| `trade_context_node` | Loads anomaly record + trader history; computes trader stats |
+| `market_context_node` | Loads ±60-min symbol window; computes market context |
+| `regulatory_screen_node` | Applies 5 rule conditions; derives severity |
+| `human_review_node` | Prints findings + calls `interrupt()` for HIGH severity when `auto_approve=False` |
+| `compliance_memo_node` | Calls Claude Haiku; generates structured JSON memo; uploads to S3 |
+
+### Severity and verdict logic
+
+| Severity | Condition | Verdict override |
+|---|---|---|
+| `HIGH` | FAT_FINGER or VOLUME_SPIKE in matched, or ≥2 rules | `ESCALATE` (if confidence=HIGH) / `MONITOR` |
+| `MEDIUM` | SPOOFING or WASH_TRADE | `MONITOR` |
+| `LOW` | OFF_HOURS only | `DISMISS` |
+| `NONE` | No rules matched | `DISMISS` |
+
+### Caching
+
+`_load_anomalies_df(profile)` and `_load_features_df(profile)` use `@functools.lru_cache` — both 40 MB+ parquet files are downloaded once per session and cached in memory. Callers (`load_anomaly_record`, `load_trader_history`, `load_market_window`) read from the cache.
+
+### Regulatory rules
+
+| Rule | Condition |
+|---|---|
+| `FAT_FINGER` | `z_score_price > 4` |
+| `VOLUME_SPIKE` | `z_score_volume > 4` |
+| `OFF_HOURS` | `is_off_hours == True` |
+| `SPOOFING` | `abs(depth_imbalance) > 0.8` |
+| `WASH_TRADE` | `trader_buy_sell_ratio > 0.9` AND `z_score_volume > 2` |
+
+### Memo schema (Claude output)
+
+```json
+{
+  "summary": "...",
+  "evidence_points": ["...", "..."],
+  "rule_violated": "RULE_NAME or NONE",
+  "verdict": "ESCALATE | MONITOR | DISMISS",
+  "confidence": "HIGH | MEDIUM | LOW",
+  "recommended_action": "...",
+  "data_gaps": "..."
+}
+```
 
 ## Athena Query Notes
 
